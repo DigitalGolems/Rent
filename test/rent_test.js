@@ -6,6 +6,9 @@ const Digibytes = artifacts.require("Digibytes")
 const AssetsContract = artifacts.require("Assets");
 const Psychospheres = artifacts.require("Psychospheres")
 const Rent = artifacts.require("Rent")
+const Card = artifacts.require("Card")
+const Conservation = artifacts.require("./Conservation.sol")
+
 const { assert } = require("chai");
 const {
     catchRevert,            
@@ -21,12 +24,15 @@ const {
 contract('Card rent', async (accounts)=>{
     let game;
     let lab;
+    let conservation;
+    let card;
     let rent;
     let assets;
     let DIG;
     let psycho;
     let DBT;
     let inventory;
+    let fedDeposit;
     let secondsInADay = 86400;
     let psychoCombining = ["0","1","2","3"];
     let user = accounts[9];
@@ -40,11 +46,16 @@ contract('Card rent', async (accounts)=>{
         lab = await Laboratory.new()
         game = await GameContract.new()
         inventory = await Inventory.new()
+        card = await Card.new()
         assets = await AssetsContract.new()
         DIG = await DigitalGolems.new()
         DBT = await Digibytes.new()
         psycho = await Psychospheres.new()
         rent = await Rent.new()
+        conservation = await Conservation.new()
+        await card.setDIGAddress(DIG.address)
+        await card.setGameAddress(game.address)
+        await DIG.setCard(card.address)
         await game.setDBT(DBT.address, {from: owner})
         await game.setDIG(DIG.address, {from: owner})
         await game.setInventory(inventory.address, {from: owner})
@@ -52,7 +63,6 @@ contract('Card rent', async (accounts)=>{
         await psycho.setGameContract(game.address)
         await psycho.setAssetsContract(assets.address)
         await psycho.setLabContract(lab.address)
-        await DIG.setGameAddress(game.address, {from: owner})
         await DIG.setLabAddress(lab.address, {from: owner})
         await lab.setAssets(assets.address, {from: owner})
         await lab.setDBT(DBT.address, {from: owner})
@@ -60,9 +70,10 @@ contract('Card rent', async (accounts)=>{
         await lab.setPsycho(psycho.address)
         await assets.setLab(lab.address)
         await psycho.addPsychosphereByOwner(user, 16, 0, {from: owner})
-        await rent.setDIG(DIG.address)
         await rent.setDBT(DBT.address)
-        await DBT.transfer(userRenter, web3.utils.toWei("7"))
+        await rent.setCard(card.address)
+        await rent.setConserve(conservation.address)
+        await DBT.transfer(userRenter, web3.utils.toWei("17"))
         //adding assets
         await DIG.ownerMint(
                 user,
@@ -74,7 +85,7 @@ contract('Card rent', async (accounts)=>{
     })
 
     it("Should create market item", async ()=>{
-        await rent.createMarketRent(
+        await rent.createOrder(
             "1", // cardID
             web3.utils.toWei("1"), //priceByDay
             "7",//days
@@ -97,7 +108,7 @@ contract('Card rent', async (accounts)=>{
         //check if this card really user
         for (let i = 0; i < allUserMarketCard.length; i++){
             assert.equal(
-                (allUserMarketCard[0][2]).toString(),
+                (await card.cardOwner((allUserMarketCard[0][1]).toString())).toString(),
                 user,
                 "Really user"
             )
@@ -105,20 +116,21 @@ contract('Card rent', async (accounts)=>{
     })
 
     it("Should rent market item", async () => {
-        await DBT.approve(rent.address, web3.utils.toWei("7"), {from: userRenter})
-        await rent.buyMarketRent(0, {from: userRenter})
+        fedDeposit = parseInt((await card.getMaxAbility(1)).max.toString()) * parseInt((await conservation.getFeedingPrice()).toString())
+        await DBT.approve(rent.address, web3.utils.toWei("7") + fedDeposit, {from: userRenter})
+        await rent.rentOrder(0, {from: userRenter})
         //checks renter items
         let renterItems = await rent.fetchRenterCardOnMarket(userRenter)
         for (let i = 0; i < renterItems.length; i++){
             assert.equal(
-                (renterItems[0][3]).toString(),
+                (renterItems[0][2]).toString(),
                 userRenter,
                 "Really userRenter"
             )
         }
         //because rent not ended
         catchRevert(
-            rent.endRentAndWithdraw(0, {from: user})
+            rent.endRentAndWithdrawOwner(0, {from: user})
         )
         //user seller has 99,7% because we take 0,3% comission
         assert.equal(
@@ -133,7 +145,7 @@ contract('Card rent', async (accounts)=>{
         )
     })
 
-    it("Should close market item", async ()=>{
+    it("Card Owner Should end rent item", async ()=>{
         let newTime = (Math.trunc(Date.now()/ 1000) - secondsInADay * 8).toString();
         assert.isFalse(
             await rent.isRentEnded(0)
@@ -142,7 +154,12 @@ contract('Card rent', async (accounts)=>{
         assert.isTrue(
             await rent.isRentEnded(0)
         )
-        await rent.endRentAndWithdraw(0, {from: user})
+        await rent.endRentAndWithdrawOwner(0, {from: user})
+        assert.isAtLeast(
+            parseInt((await DBT.balanceOf(userRenter)).toString()),
+            fedDeposit,
+            "Renter take fed deposit back"
+        )
         assert.equal(
             (await DBT.balanceOf(user, {from: user})).toString(),
             web3.utils.toWei("7") * 997 / 1000,
