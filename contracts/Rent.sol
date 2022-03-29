@@ -3,15 +3,15 @@
 pragma experimental ABIEncoderV2;
 pragma solidity 0.8.10;
 
-import "../../DigitalGolems/Card.sol";
-import "../../Digibytes/Digibytes.sol";
-import "../Laboratory/Conservation.sol";
-import "../../Utils/SafeMath.sol";
+import "../../DigitalGolems/Interfaces/ICard.sol";
+import "../../Digibytes/Interfaces/IBEP20.sol";
+import "../Interfaces/IConservation.sol";
 import "../../Utils/Owner.sol";
 import "@openzeppelin/contracts/utils/Counters.sol";
 import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "./IRent.sol";
 
-contract Rent is Owner {
+contract Rent is Owner, ReentrancyGuard, IRent {
     using Counters for Counters.Counter;
 
     Counters.Counter private _itemsListedForRent;
@@ -21,12 +21,8 @@ contract Rent is Owner {
 
     uint32 secondsInADay = 86400;
 
-    Card public card;
-    Conservation public conservation;
-
-    using SafeMath for uint;
-    using SafeMath32 for uint32;
-    using SafeMath16 for uint16;
+    ICard public card;
+    IConservation public conservation;
 
     struct CardForRent {
         uint256 itemID;
@@ -38,13 +34,14 @@ contract Rent is Owner {
         uint256 timeWhenRentStarted;
         uint256 priceByDay;
         uint256 deposit;
+        uint256 feedPrice;
     }
 
     CardForRent[] marketItems;
     mapping(uint256 => uint256) itemIDToFeedDeposit;
     uint256 thisDBTBalance;
 
-    Digibytes public DBT;
+    IBEP20 public DBT;
 
     //creating market order for our golem to rent it
     //modifier checks if we already create it
@@ -52,12 +49,13 @@ contract Rent is Owner {
         uint256 cardID,     //cardID that also equals to NFT ID
         uint256 price,      //price by day in Wei
         uint8 timeInDays    //time in days (MAX = 63 days)
-    ) 
-        external 
+    )
+        external
         onlyIfCardNotAlreadyAdded(cardID)
+        cardOnPreserve(cardID)
     {
         //checks sender equal to card owner
-        require(msg.sender == card.cardOwner(cardID), "Your not owner");
+        require(msg.sender == card.cardOwner(cardID), "You not owner");
         //checks if golem fed on maximum - all abilities in normal state
         require(card.isAllInitialAbilities(cardID) == true, "Please feed golem");
         //price cant be 0
@@ -74,12 +72,14 @@ contract Rent is Owner {
             false,      //closed
             0,          //timeWhenRentStarted,
             price,      //priceByDay,
-            0           //deposit
+            0,           //deposit
+            0           //feedPrice - here because we can change feed price in one moment so fedDeposit would be change
         ));
         //listed items +1
         _itemsListedForRent.increment();
         //all items +1
         _items.increment();
+        emit CreateOrder(cardID, price, timeInDays);
     }
 
     //changing market order time
@@ -90,10 +90,11 @@ contract Rent is Owner {
         uint8 _newTimeToRent //new time in days (MAX = 63)
     )
         public
-        onlyCardOwner(itemID) 
-        itemClosedNorRented(itemID) 
+        onlyCardOwner(itemID)
+        itemClosedNorRented(itemID)
     {
         marketItems[itemID].timeToRent = _newTimeToRent;
+        emit ChangeOrderTime(itemID, _newTimeToRent);
     }
 
     function changeOrderPrice(
@@ -101,10 +102,11 @@ contract Rent is Owner {
         uint256 _price      //new price by day in Wei
     )
         public
-        onlyCardOwner(itemID) 
-        itemClosedNorRented(itemID) 
+        onlyCardOwner(itemID)
+        itemClosedNorRented(itemID)
     {
         marketItems[itemID].priceByDay = _price;
+        emit ChangeOrderPrice(itemID, _price);
     }
 
     //closing market item
@@ -120,18 +122,20 @@ contract Rent is Owner {
         _itemsClosedRent.increment();
         _itemsListedForRent.decrement();
         marketItems[itemID].closed = true;
+        emit CloseOrder(itemID);
     }
 
     //reopen closed order
     function openOrder(
         uint256 itemID
-    ) public onlyCardOwner(itemID) {
+    ) public onlyCardOwner(itemID) cardOnPreserve(marketItems[itemID].cardID) {
         //it should be closed
         require(marketItems[itemID].closed == true, "Its already open");
         //writing data
         _itemsClosedRent.decrement();
         _itemsListedForRent.increment();
         marketItems[itemID].closed = false;
+        emit OpenOrder(itemID);
     }
 
     //calls by card owner
@@ -143,6 +147,7 @@ contract Rent is Owner {
         //checks rent is ended
         require(isRentEnded(itemID) == true, "Rent not ended");
         _endRentAndWithdraw(itemID);
+        emit EndRent(itemID);
     }
 
     //calls by renter for take back feed deposit
@@ -152,6 +157,7 @@ contract Rent is Owner {
         require(isRentEnded(itemID) == true, "Rent not ended");
         require(msg.sender == marketItems[itemID].cardRenter, "You not renter");
         _endRentAndWithdraw(itemID);
+        emit EndRent(itemID);
     }
 
     function _endRentAndWithdraw(uint256 _itemID) private {
@@ -175,15 +181,15 @@ contract Rent is Owner {
     //take fed deposit and transfer it to owner or renter
     //direction depends from changing max ability
     function takeFedDeposit(uint256 _itemID) private {
-        //if golems abilitis not in normal state (means not in initial)
+        //if golems abilities not in normal state (means not in initial)
         if (card.isAllInitialAbilities(marketItems[_itemID].cardID) == false) {
             //counting difference between initial value and actual of max ability
             //that means we should to fed golem to get this max ability
             uint16 _diff = card.diffrenceBetweenInitialAndActualMaxAbilities(marketItems[_itemID].cardID);
             //transfer to card owner fed deposit difference multiplyed by feeding price from fed deposit
-            DBT.transfer(_getCardOwnerByItemID(_itemID), conservation.getFeedingPrice() * _diff);
+            DBT.transfer(_getCardOwnerByItemID(_itemID), marketItems[_itemID].feedPrice * _diff);
             //changing fed deposit with considering difference
-            itemIDToFeedDeposit[_itemID] = itemIDToFeedDeposit[_itemID] - conservation.getFeedingPrice() * _diff;
+            itemIDToFeedDeposit[_itemID] = itemIDToFeedDeposit[_itemID] - marketItems[_itemID].feedPrice * _diff;
             //if fed deposit not 0 we send it to renter
             //otherwise will be revert
             if (itemIDToFeedDeposit[_itemID] != 0) {
@@ -200,9 +206,9 @@ contract Rent is Owner {
     //modifier checks if item exist and not rented
     function rentOrder(
         uint256 itemID
-    ) 
-        external 
-        itemClosedNorRented(itemID) 
+    )
+        external
+        itemClosedNorRented(itemID)
     {
         //counting amount to pay for rent priceByDay multiplied by timeToRent(days)
         uint256 amount = marketItems[itemID].priceByDay * marketItems[itemID].timeToRent;
@@ -216,6 +222,7 @@ contract Rent is Owner {
         marketItems[itemID].cardRenter = msg.sender;
         marketItems[itemID].rented = true;
         marketItems[itemID].timeWhenRentStarted = block.timestamp;
+        marketItems[itemID].feedPrice = conservation.getFeedingPrice();//fix feed price
         //transfer to dbt to contract
         DBT.transferFrom(msg.sender, address(this), amount + fedDeposit);
         //deposit(earned money by card owner) = 99,7% of amount because contract take commission 0,3%
@@ -224,6 +231,7 @@ contract Rent is Owner {
         thisDBTBalance = amount - marketItems[itemID].deposit;
         //write fed deposit
         itemIDToFeedDeposit[itemID] = fedDeposit;
+        emit Rent(itemID, msg.sender);
     }
 
     //counting fed deposit for rent order
@@ -320,15 +328,15 @@ contract Rent is Owner {
     }
 
     function setDBT(address _dbt) public isOwner {
-        DBT = Digibytes(_dbt);
+        DBT = IBEP20(_dbt);
     }
 
     function setCard(address _card) public isOwner {
-        card = Card(_card);
+        card = ICard(_card);
     }
 
     function setConserve(address _conserve) public isOwner {
-        conservation = Conservation(_conserve);
+        conservation = IConservation(_conserve);
     }
 
     //TESTING
@@ -352,6 +360,11 @@ contract Rent is Owner {
     modifier itemClosedNorRented(uint256 _itemID) {
         require(marketItems[_itemID].rented == false, "Item already rented");
         require(marketItems[_itemID].closed == false, "Item closed");
+        _;
+    }
+
+    modifier cardOnPreserve(uint256 cardID) {
+        require(conservation.isPreservated(cardID) == false, "Card on preserve");
         _;
     }
 
